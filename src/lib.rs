@@ -48,13 +48,13 @@
 //!
 //! ## State Machine
 //!
-//! The `StateMachine` represents the **stateful representation** of your application. Events
+//! The `StateMachine` represents the **stateful representation** of your application. ready
 //! are applied to the `StateMachine` in the correct ordering at the time of commit. This is where
 //! your application **should** act on information.
 //!
 //! In the `StateMachine` there are both mutable (`.apply()`) and immutable (`.query()`) calls.
 //! There is a considerable performance difference, as `.query()` calls do not pass through the
-//! durable `Log` while `.apply()` events do.
+//! durable `Log` while `.apply()` ready do.
 //!
 //! Some ideas for a State Machine implementation:
 //!
@@ -91,6 +91,7 @@ extern crate wrapped_enum;
 extern crate env_logger;
 #[cfg(feature = "serde")]
 extern crate serde;
+extern crate slab;
 
 /// Prepares the environment testing. Should be called as the first line of every test with the
 /// name of the test as the only argument.
@@ -100,7 +101,7 @@ extern crate serde;
 macro_rules! setup_test {
     ($test_name:expr) => (
         let _ = env_logger::init();
-        push_log_scope!($test_name);
+        info!($test_name);
     );
 }
 

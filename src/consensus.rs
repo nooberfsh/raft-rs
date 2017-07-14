@@ -1,6 +1,6 @@
 //! `Consensus` is a state-machine (not to be confused with the `StateMachine` trait) which
-//! implements the logic of the Raft Protocol. A `Consensus` receives events from the local
-//! `Server`. The set of possible events is specified by the Raft Protocol:
+//! implements the logic of the Raft Protocol. A `Consensus` receives ready from the local
+//! `Server`. The set of possible ready is specified by the Raft Protocol:
 //!
 //! ```text
 //! Event = AppendEntriesRequest | AppendEntriesResponse
@@ -178,7 +178,7 @@ impl<L, M> Consensus<L, M>
                                  actions: &mut Actions)
         where S: ReaderSegments
     {
-        push_log_scope!("{:?}", self);
+        info!("{:?}", self);
         let reader = message.get_root::<message::Reader>().unwrap().which().unwrap();
         match reader {
             message::Which::AppendEntriesRequest(Ok(request)) => {
@@ -204,7 +204,7 @@ impl<L, M> Consensus<L, M>
                                    actions: &mut Actions)
         where S: ReaderSegments
     {
-        push_log_scope!("{:?}", self);
+        info!("{:?}", self);
         let reader = message.get_root::<client_request::Reader>().unwrap().which().unwrap();
         match reader {
             client_request::Which::Proposal(Ok(request)) => {
@@ -217,7 +217,7 @@ impl<L, M> Consensus<L, M>
 
     /// Applies a timeout's actions to the `Consensus`.
     pub fn apply_timeout(&mut self, timeout: ConsensusTimeout, actions: &mut Actions) {
-        push_log_scope!("{:?}", self);
+        info!("{:?}", self);
         match timeout {
             ConsensusTimeout::Election => self.election_timeout(actions),
             ConsensusTimeout::Heartbeat(peer) => self.heartbeat_timeout(peer, actions),
@@ -230,7 +230,7 @@ impl<L, M> Consensus<L, M>
                                  peer: ServerId,
                                  addr: SocketAddr,
                                  actions: &mut Actions) {
-        push_log_scope!("{:?}", self);
+        info!("{:?}", self);
         self.peers.insert(peer, addr).expect("new peer insertion not supported");
         match self.state {
             ConsensusState::Leader => {

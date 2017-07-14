@@ -3,8 +3,7 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 
 use mio::tcp::TcpStream;
-use mio::Timeout as TimeoutHandle;
-use mio::{EventLoop, EventSet, PollOpt, Token};
+use mio::{Poll, Ready, PollOpt, Token};
 use capnp::message::{Builder, HeapAllocator, Reader, ReaderOptions};
 use capnp_nonblock::{MessageStream, Segments};
 
@@ -154,24 +153,24 @@ impl Connection {
         }
     }
 
-    fn events(&self) -> EventSet {
-        let mut events = EventSet::all();
+    fn ready(&self) -> Ready {
+        let mut ready = Ready::all();
         if self.stream().outbound_queue_len() == 0 {
-            events = events - EventSet::writable();
+            ready = ready - Ready::writable();
         }
-        events
+        ready
     }
 
     /// Registers the connection with the event loop.
     pub fn register<L, M>(&mut self,
-                          event_loop: &mut EventLoop<Server<L, M>>,
+                          poll: &Poll,
                           token: Token)
                           -> Result<()>
         where L: Log,
               M: StateMachine
     {
         scoped_trace!("{:?}: register", self);
-        event_loop.register(self.stream().inner(), token, self.events(), poll_opt())
+        poll.register(self.stream().inner(), token, self.ready(), poll_opt())
                   .map_err(|error| {
                       scoped_warn!("{:?}: reregister failed: {}", self, error);
                       From::from(error)
@@ -180,14 +179,14 @@ impl Connection {
 
     /// Reregisters the connection with the event loop.
     pub fn reregister<L, M>(&mut self,
-                            event_loop: &mut EventLoop<Server<L, M>>,
+                            poll: &Poll,
                             token: Token)
                             -> Result<()>
         where L: Log,
               M: StateMachine
     {
         scoped_trace!("{:?}: reregister", self);
-        event_loop.reregister(self.stream().inner(), token, self.events(), poll_opt())
+        poll.reregister(self.stream().inner(), token, self.ready(), poll_opt())
                   .map_err(|error| {
                       scoped_warn!("{:?}: register failed: {}", self, error);
                       From::from(error)
@@ -207,7 +206,7 @@ impl Connection {
 
     /// Resets a peer connection.
     pub fn reset_peer<L, M>(&mut self,
-                            event_loop: &mut EventLoop<Server<L, M>>,
+                            poll: &Poll,
                             token: Token)
                             -> Result<(ServerTimeout, TimeoutHandle)>
         where L: Log,
@@ -217,7 +216,7 @@ impl Connection {
         self.stream = None;
         let duration = self.backoff.next_backoff_ms();
         let timeout = ServerTimeout::Reconnect(token);
-        let handle = event_loop.timeout_ms(timeout, duration).unwrap();
+        let handle = poll.timeout_ms(timeout, duration).unwrap();
 
         scoped_info!("{:?}: reset, will attempt to reconnect in {}ms",
                      self,

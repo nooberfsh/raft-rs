@@ -11,10 +11,9 @@ use std::thread::{self, JoinHandle};
 use std::rc::Rc;
 
 use mio::tcp::TcpListener;
-use mio::util::Slab;
-use mio::{EventLoop, EventSet, Handler, PollOpt, Token};
-use mio::Timeout as TimeoutHandle;
+use mio::{Poll, Ready, PollOpt, Token};
 use capnp::message::{Builder, HeapAllocator};
+use slab;
 
 use ClientId;
 use Result;
@@ -30,8 +29,9 @@ use connection::{Connection, ConnectionKind};
 
 const LISTENER: Token = Token(0);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+type Slab<T> = slab::Slab<T, Token>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum ServerTimeout {
     Consensus(ConsensusTimeout),
     Reconnect(Token),
@@ -119,17 +119,17 @@ where
     }
 }
 
-/// The `Server` is responsible for receiving events from peer `Server` instance or clients,
+/// The `Server` is responsible for receiving ready from peer `Server` instance or clients,
 /// as well as managing election and heartbeat timeouts. When an event is received, it is applied
-/// to the local `Consensus`. The `Consensus` may optionally return a set of events to be
+/// to the local `Consensus`. The `Consensus` may optionally return a set of ready to be
 /// dispatched to either remote peers or clients.
 ///
 /// ## Logging
 ///
-/// Server instances log events according to frequency and importance. It is recommended to use at
+/// Server instances log ready according to frequency and importance. It is recommended to use at
 /// least info level logging when running in production. The warn level is used for unexpected,
-/// but recoverable events. The info level is used for infrequent events such as connection resets
-/// and election results. The debug level is used for frequent events such as client proposals and
+/// but recoverable ready. The info level is used for infrequent ready such as connection resets
+/// and election results. The debug level is used for frequent ready such as client proposals and
 /// heartbeats. The trace level is used for very high frequency debugging output.
 pub struct Server<L, M>
     where L: Log,
@@ -161,6 +161,13 @@ pub struct Server<L, M>
 
     /// Configured timeouts
     timeout_config: TimeoutConfiguration,
+
+    /// Poll
+    poll: Poll,
+}
+
+fn all_interests() -> Ready {
+    Ready::readable() | Ready::writable() | Ready::error() | Ready::hup()
 }
 
 /// The implementation of the Server.
@@ -213,6 +220,7 @@ impl<L, M> Server<L, M>
             consensus_timeouts: HashMap::new(),
             reconnection_timeouts: HashMap::new(),
             timeout_config: timeout_config,
+            poll: Poll::new()?,
         };
 
         for (peer_id, peer_addr) in peers {
@@ -226,13 +234,12 @@ impl<L, M> Server<L, M>
         Ok(server)
     }
 
-    fn start_loop(&mut self) -> Result<EventLoop<Server<L, M>>>
+    fn start_loop(&mut self) -> Result<()>
     where
         L: Log,
         M: StateMachine
     {
-        let mut event_loop = try!(EventLoop::<Server<L, M>>::new());
-        try!(event_loop.register(&self.listener, LISTENER, EventSet::all(), PollOpt::level()));
+        self.poll.register(&self.listener, LISTENER, all_interests(), PollOpt::level())?;
         let mut tokens = vec![];
         for token in self.peer_tokens.values() {
             tokens.push(*token);
@@ -240,12 +247,12 @@ impl<L, M> Server<L, M>
         let id = self.id;
         let addr = self.listener.local_addr()?;
         for token in tokens {
-            try!(self.connections[token].register(&mut event_loop, token));
-            self.send_message(&mut event_loop,
+            self.connections[token].register(&self.poll, token)?;
+            self.send_message(
                                 token,
                                 messages::server_connection_preamble(id, &addr));
         }
-        Ok(event_loop)
+        Ok(())
     }
     /// Runs a new Raft server in the current thread.
     ///
@@ -257,10 +264,10 @@ impl<L, M> Server<L, M>
     /// * `store` - The persistent log store.
     /// * `state_machine` - The client state machine to which client commands will be applied.
     pub fn run(&mut self) -> Result<()> {
-        let mut event_loop = try!(self.start_loop());
+        self.start_loop()?;
         let actions = self.consensus.init();
-        self.execute_actions(&mut event_loop, actions);
-        event_loop.run(self).map_err(From::from)
+        self.execute_actions(actions);
+        poll.run(self).map_err(From::from)
     }
 
     /// Spawns a new Raft server in a background thread.
@@ -289,24 +296,23 @@ impl<L, M> Server<L, M>
     /// Sends the message to the connection associated with the provided token.
     /// If sending the message fails, the connection is reset.
     fn send_message(&mut self,
-                    event_loop: &mut EventLoop<Server<L, M>>,
                     token: Token,
                     message: Rc<Builder<HeapAllocator>>) {
         match self.connections[token].send_message(message) {
             Ok(false) => (),
             Ok(true) => {
                 self.connections[token]
-                    .reregister(event_loop, token)
-                    .unwrap_or_else(|_| self.reset_connection(event_loop, token));
+                    .reregister(&self.poll, token)
+                    .unwrap_or_else(|_| self.reset_connection(token));
             }
             Err(error) => {
                 scoped_warn!("{:?}: error while sending message: {:?}", self, error);
-                self.reset_connection(event_loop, token);
+                self.reset_connection(token);
             }
         }
     }
 
-    fn execute_actions(&mut self, event_loop: &mut EventLoop<Server<L, M>>, actions: Actions) {
+    fn execute_actions(&mut self, actions: Actions) {
         scoped_trace!("executing actions: {:?}", actions);
         let Actions { peer_messages,
                       client_messages,
@@ -321,16 +327,16 @@ impl<L, M> Server<L, M>
         }
         for (peer, message) in peer_messages {
             let token = self.peer_tokens[&peer];
-            self.send_message(event_loop, token, message);
+            self.send_message(token, message);
         }
         for (client, message) in client_messages {
             if let Some(&token) = self.client_tokens.get(&client) {
-                self.send_message(event_loop, token, message);
+                self.send_message(token, message);
             }
         }
         if clear_timeouts {
             for (timeout, &handle) in &self.consensus_timeouts {
-                scoped_assert!(event_loop.clear_timeout(handle),
+                scoped_assert!(&self.poll.clear_timeout(handle),
                                "unable to clear timeout: {:?}",
                                timeout);
             }
@@ -342,14 +348,15 @@ impl<L, M> Server<L, M>
             // Registering a timeout may only fail if the maximum number of timeouts
             // is already registered, which is by default 65,536. We use a
             // maximum of one timeout per peer, so this unwrap should be safe.
-            let handle = event_loop.timeout_ms(ServerTimeout::Consensus(timeout), duration)
+            let handle = &self.poll.timeout_ms(ServerTimeout::Consensus(timeout), duration)
                                    .unwrap();
             self.consensus_timeouts
                 .insert(timeout, handle)
                 .map(|handle| {
-                    scoped_assert!(event_loop.clear_timeout(handle),
-                                   "unable to clear timeout: {:?}",
-                                   timeout)
+                    //todo;
+                    //scoped_assert!(&self.poll.clear_timeout(handle),
+                                   //"unable to clear timeout: {:?}",
+                                   //timeout)
                 });
         }
     }
@@ -360,13 +367,13 @@ impl<L, M> Server<L, M>
     /// period.
     ///
     /// If the connection is to a client or unknown it will be closed.
-    fn reset_connection(&mut self, event_loop: &mut EventLoop<Server<L, M>>, token: Token) {
+    fn reset_connection(&mut self, token: Token) {
         let kind = *self.connections[token].kind();
         match kind {
             ConnectionKind::Peer(..) => {
                 // Crash if reseting the connection fails.
                 let (timeout, handle) = self.connections[token]
-                                            .reset_peer(event_loop, token)
+                                            .reset_peer(&self.poll, token)
                                             .unwrap();
 
                 scoped_assert!(self.reconnection_timeouts.insert(token, handle).is_none(),
@@ -389,7 +396,7 @@ impl<L, M> Server<L, M>
     ///
     /// If the connection returns an error on any operation, or any message fails to be
     /// deserialized, an error result is returned.
-    fn readable(&mut self, event_loop: &mut EventLoop<Server<L, M>>, token: Token) -> Result<()> {
+    fn readable(&mut self, token: Token) -> Result<()> {
         scoped_trace!("{:?}: readable event", self.connections[token]);
         // Read messages from the connection until there are no more.
         while let Some(message) = try!(self.connections[token].readable()) {
@@ -397,12 +404,12 @@ impl<L, M> Server<L, M>
                 ConnectionKind::Peer(id) => {
                     let mut actions = Actions::new();
                     self.consensus.apply_peer_message(id, &message, &mut actions);
-                    self.execute_actions(event_loop, actions);
+                    self.execute_actions(&self.poll, actions);
                 }
                 ConnectionKind::Client(id) => {
                     let mut actions = Actions::new();
                     self.consensus.apply_client_message(id, &message, &mut actions);
-                    self.execute_actions(event_loop, actions);
+                    self.execute_actions(&self.poll, actions);
                 }
                 ConnectionKind::Unknown => {
                     let preamble = try!(message.get_root::<connection_preamble::Reader>());
@@ -440,7 +447,7 @@ impl<L, M> Server<L, M>
                                     self.reconnection_timeouts
                                         .remove(&tok)
                                         .map(|handle| {
-                                            scoped_assert!(event_loop.clear_timeout(handle))
+                                            scoped_assert!(&self.poll.clear_timeout(handle))
                                         });
                                 }
                                 _ => unreachable!(),
@@ -448,7 +455,7 @@ impl<L, M> Server<L, M>
                             // Notify consensus that the connection reset.
                             let mut actions = Actions::new();
                             self.consensus.peer_connection_reset(peer_id, peer_addr, &mut actions);
-                            self.execute_actions(event_loop, actions);
+                            self.execute_actions(&self.poll, actions);
                         }
                         connection_preamble::id::Which::Client(Ok(id)) => {
                             let client_id = try!(ClientId::from_bytes(id));
@@ -473,7 +480,7 @@ impl<L, M> Server<L, M>
 
     /// Accepts a new TCP connection, adds it to the connection slab, and registers it with the
     /// event loop.
-    fn accept_connection(&mut self, event_loop: &mut EventLoop<Server<L, M>>) -> Result<()> {
+    fn accept_connection(&mut self) -> Result<()> {
         scoped_trace!("accept_connection");
         self.listener
             .accept()
@@ -496,9 +503,9 @@ impl<L, M> Server<L, M>
                 // result in a leaked TCP stream and slab entry. Instead of dropping the
                 // connection, it will be reset if an error occurs.
                 self.connections[token]
-                    .register(event_loop, token)
+                    .register(&self.poll, token)
                     .or_else(|_| {
-                        self.reset_connection(event_loop, token);
+                        self.reset_connection(&self.poll, token);
                         Err(Error::Raft(RaftError::ConnectionRegisterFailed))
                     })
                     .map(|_| scoped_debug!("new connection accepted from {}",
@@ -513,58 +520,58 @@ impl<L, M> Handler for Server<L, M>
     type Message = ();
     type Timeout = ServerTimeout;
 
-    fn ready(&mut self, event_loop: &mut EventLoop<Server<L, M>>, token: Token, events: EventSet) {
-        push_log_scope!("{:?}", self);
-        scoped_trace!("ready; token: {:?}; events: {:?}", token, events);
+    fn ready(&mut self, token: Token, ready: Ready) {
+        info!("{:?}", self);
+        scoped_trace!("ready; token: {:?}; ready: {:?}", token, ready);
 
-        if events.is_error() {
+        if ready.is_error() {
             scoped_assert!(token != LISTENER, "unexpected error event from LISTENER");
             scoped_warn!("{:?}: error event", self.connections[token]);
-            self.reset_connection(event_loop, token);
+            self.reset_connection(&self.poll, token);
             return;
         }
 
-        if events.is_hup() {
+        if ready.is_hup() {
             scoped_assert!(token != LISTENER, "unexpected hup event from LISTENER");
             scoped_trace!("{:?}: hup event", self.connections[token]);
-            self.reset_connection(event_loop, token);
+            self.reset_connection(&self.poll, token);
             return;
         }
 
-        if events.is_writable() {
+        if ready.is_writable() {
             scoped_assert!(token != LISTENER, "unexpected writeable event for LISTENER");
             if let Err(error) = self.connections[token].writable() {
                 scoped_warn!("{:?}: failed write: {}", self.connections[token], error);
-                self.reset_connection(event_loop, token);
+                self.reset_connection(&self.poll, token);
                 return;
             }
-            if !events.is_readable() {
+            if !ready.is_readable() {
                 self.connections[token]
-                    .reregister(event_loop, token)
-                    .unwrap_or_else(|_| self.reset_connection(event_loop, token));
+                    .reregister(&self.poll, token)
+                    .unwrap_or_else(|_| self.reset_connection(&self.poll, token));
             }
         }
 
-        if events.is_readable() {
+        if ready.is_readable() {
             if token == LISTENER {
-                self.accept_connection(event_loop)
+                self.accept_connection(&self.poll)
                     .unwrap_or_else(|error| scoped_warn!("unable to accept connection: {}", error));
             } else {
-                self.readable(event_loop, token)
+                self.readable(&self.poll, token)
                     // Only reregister the connection with the event loop if no error occurs and
                     // the connection is *not* reset.
-                    .and_then(|_| self.connections[token].reregister(event_loop, token))
+                    .and_then(|_| self.connections[token].reregister(&self.poll, token))
                     .unwrap_or_else(|error| {
                         scoped_warn!("{:?}: failed read: {}",
                                      self.connections[token], error);
-                        self.reset_connection(event_loop, token);
+                        self.reset_connection(&self.poll, token);
                     });
             }
         }
     }
 
-    fn timeout(&mut self, event_loop: &mut EventLoop<Server<L, M>>, timeout: ServerTimeout) {
-        push_log_scope!("{:?}", self);
+    fn timeout(&mut self, timeout: ServerTimeout) {
+        info!("{:?}", self);
         scoped_trace!("timeout: {:?}", &timeout);
         match timeout {
             ServerTimeout::Consensus(consensus) => {
@@ -573,7 +580,7 @@ impl<L, M> Handler for Server<L, M>
                                timeout);
                 let mut actions = Actions::new();
                 self.consensus.apply_timeout(consensus, &mut actions);
-                self.execute_actions(event_loop, actions);
+                self.execute_actions(&self.poll, actions);
             }
 
             ServerTimeout::Reconnect(token) => {
@@ -590,17 +597,17 @@ impl<L, M> Handler for Server<L, M>
                 let addr = *self.connections[token].addr();
                 self.connections[token]
                     .reconnect_peer(self.id, &local_addr.unwrap())
-                    .and_then(|_| self.connections[token].register(event_loop, token))
+                    .and_then(|_| self.connections[token].register(&self.poll, token))
                     .map(|_| {
                         let mut actions = Actions::new();
                         self.consensus.peer_connection_reset(id, addr, &mut actions);
-                        self.execute_actions(event_loop, actions);
+                        self.execute_actions(&self.poll, actions);
                     })
                     .unwrap_or_else(|error| {
                         scoped_warn!("unable to reconnect connection {:?}: {}",
                                      self.connections[token],
                                      error);
-                        self.reset_connection(event_loop, token);
+                        self.reset_connection(&self.poll, token);
                     });
             }
         }
@@ -654,8 +661,8 @@ mod tests {
                                           .with_heartbeat_millis(1000)
                                           .with_max_connections(129)
                                           .finalize());
-        let event_loop = try!(server.start_loop());
-        Ok((server, event_loop))
+        let poll = try!(server.start_loop());
+        Ok((server, poll))
     }
 
     /// Attempts to grab a local, unbound socket address for testing.
@@ -727,7 +734,7 @@ mod tests {
 
         let mut peers = HashMap::new();
         peers.insert(peer_id, peer_listener.local_addr().unwrap());
-        let (mut server, mut event_loop) = new_test_server(peers).unwrap();
+        let (mut server, mut poll) = new_test_server(peers).unwrap();
 
         // Accept the server's connection.
         let (mut stream, _) = peer_listener.accept().unwrap();
@@ -738,11 +745,11 @@ mod tests {
 
         // Drop the connection.
         drop(stream);
-        event_loop.run_once(&mut server, None).unwrap();
+        poll.run_once(&mut server, None).unwrap();
         assert!(!peer_connected(&server, peer_id));
 
         // Check that the server reconnects after a timeout.
-        event_loop.run_once(&mut server, None).unwrap();
+        poll.run_once(&mut server, None).unwrap();
         assert!(peer_connected(&server, peer_id));
         let (mut stream, _) = peer_listener.accept().unwrap();
 
@@ -763,7 +770,7 @@ mod tests {
 
         let mut peers = HashMap::new();
         peers.insert(peer_id, peer_listener.local_addr().unwrap());
-        let (mut server, mut event_loop) = new_test_server(peers).unwrap();
+        let (mut server, mut poll) = new_test_server(peers).unwrap();
 
         // Accept the server's connection.
         let (mut in_stream, _) = peer_listener.accept().unwrap();
@@ -776,7 +783,7 @@ mod tests {
 
         // Open a replacement connection to the server.
         let mut out_stream = TcpStream::connect(server_addr).unwrap();
-        event_loop.run_once(&mut server, None).unwrap();
+        poll.run_once(&mut server, None).unwrap();
 
         // This is what the new peer tells the server is listening address is.
         let fake_peer_addr = SocketAddr::from_str("192.168.0.1:12345").unwrap();
@@ -785,7 +792,7 @@ mod tests {
                                  &*messages::server_connection_preamble(peer_id, &fake_peer_addr))
             .unwrap();
         out_stream.flush().unwrap();
-        event_loop.run_once(&mut server, None).unwrap();
+        poll.run_once(&mut server, None).unwrap();
 
         // Make sure that reconnecting updated the peer address
         // known to `Consensus` with the one given in the preamble.
@@ -803,12 +810,12 @@ mod tests {
     fn test_client_accept() {
         setup_test!("test_client_accept");
 
-        let (mut server, mut event_loop) = new_test_server(HashMap::new()).unwrap();
+        let (mut server, mut poll) = new_test_server(HashMap::new()).unwrap();
 
         // Connect to the server.
         let server_addr = server.listener.local_addr().unwrap();
         let mut stream = TcpStream::connect(server_addr).unwrap();
-        event_loop.run_once(&mut server, None).unwrap();
+        poll.run_once(&mut server, None).unwrap();
 
         let client_id = ClientId::new();
 
@@ -817,7 +824,7 @@ mod tests {
                                  &*messages::client_connection_preamble(client_id))
             .unwrap();
         stream.flush().unwrap();
-        event_loop.run_once(&mut server, None).unwrap();
+        poll.run_once(&mut server, None).unwrap();
 
         // Check that the server holds on to the client connection.
         assert!(client_connected(&server, client_id));
@@ -825,7 +832,7 @@ mod tests {
         // Check that the server disposes of the client connection when the TCP
         // stream is dropped.
         drop(stream);
-        event_loop.run_once(&mut server, None).unwrap();
+        poll.run_once(&mut server, None).unwrap();
         assert!(!client_connected(&server, client_id));
     }
 
@@ -835,17 +842,17 @@ mod tests {
     fn test_invalid_accept() {
         setup_test!("test_invalid_accept");
 
-        let (mut server, mut event_loop) = new_test_server(HashMap::new()).unwrap();
+        let (mut server, mut poll) = new_test_server(HashMap::new()).unwrap();
 
         // Connect to the server.
         let server_addr = server.listener.local_addr().unwrap();
         let mut stream = TcpStream::connect(server_addr).unwrap();
-        event_loop.run_once(&mut server, None).unwrap();
+        poll.run_once(&mut server, None).unwrap();
 
         // Send an invalid preamble.
         stream.write(b"foo bar baz").unwrap();
         stream.flush().unwrap();
-        event_loop.run_once(&mut server, None).unwrap();
+        poll.run_once(&mut server, None).unwrap();
 
         // Check that the server disposes of the connection.
         assert!(stream_shutdown(&mut stream));
@@ -863,7 +870,7 @@ mod tests {
 
         let mut peers = HashMap::new();
         peers.insert(peer_id, peer_listener.local_addr().unwrap());
-        let (mut server, mut event_loop) = new_test_server(peers).unwrap();
+        let (mut server, mut poll) = new_test_server(peers).unwrap();
 
         // Accept the server's connection.
         let (mut stream_a, _) = peer_listener.accept().unwrap();
@@ -874,13 +881,13 @@ mod tests {
         // Send an invalid message.
         stream_a.write(b"foo bar baz").unwrap();
         stream_a.flush().unwrap();
-        event_loop.run_once(&mut server, None).unwrap();
+        poll.run_once(&mut server, None).unwrap();
 
         // Check that the server resets the connection.
         assert!(!peer_connected(&server, peer_id));
 
         // Check that the server reconnects after a timeout.
-        event_loop.run_once(&mut server, None).unwrap();
+        poll.run_once(&mut server, None).unwrap();
         assert!(peer_connected(&server, peer_id));
     }
 
@@ -890,12 +897,12 @@ mod tests {
     fn test_invalid_client_message() {
         setup_test!("test_invalid_client_message");
 
-        let (mut server, mut event_loop) = new_test_server(HashMap::new()).unwrap();
+        let (mut server, mut poll) = new_test_server(HashMap::new()).unwrap();
 
         // Connect to the server.
         let server_addr = server.listener.local_addr().unwrap();
         let mut stream = TcpStream::connect(server_addr).unwrap();
-        event_loop.run_once(&mut server, None).unwrap();
+        poll.run_once(&mut server, None).unwrap();
 
         let client_id = ClientId::new();
 
@@ -904,7 +911,7 @@ mod tests {
                                  &*messages::client_connection_preamble(client_id))
             .unwrap();
         stream.flush().unwrap();
-        event_loop.run_once(&mut server, None).unwrap();
+        poll.run_once(&mut server, None).unwrap();
 
         // Check that the server holds on to the client connection.
         assert!(client_connected(&server, client_id));
@@ -912,7 +919,7 @@ mod tests {
         // Send an invalid client message to the server.
         stream.write(b"foo bar baz").unwrap();
         stream.flush().unwrap();
-        event_loop.run_once(&mut server, None).unwrap();
+        poll.run_once(&mut server, None).unwrap();
 
         // Check that the server disposes of the client connection.
         assert!(!client_connected(&server, client_id));
@@ -944,7 +951,7 @@ mod tests {
         let mut peers = HashMap::new();
         let peer_addr = peer_listener.local_addr().unwrap();
         peers.insert(peer_id, peer_addr);
-        let (mut server, mut event_loop) = new_test_server(peers).unwrap();
+        let (mut server, mut poll) = new_test_server(peers).unwrap();
 
         // Accept the server's connection.
         let (mut in_stream, _) = peer_listener.accept().unwrap();
@@ -956,7 +963,7 @@ mod tests {
         let mut actions = Actions::new();
         actions.peer_messages
                .push((peer_id, messages::server_connection_preamble(peer_id, &peer_addr)));
-        server.execute_actions(&mut event_loop, actions);
+        server.execute_actions(&mut poll, actions);
 
         assert_eq!(peer_id, read_server_preamble(&mut in_stream));
     }
